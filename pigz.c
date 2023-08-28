@@ -1,6 +1,6 @@
 /* pigz.c -- parallel implementation of gzip
- * Copyright (C) 2007-2022 Mark Adler
- * Version 2.7  15 Jan 2022  Mark Adler
+ * Copyright (C) 2007-2023 Mark Adler
+ * Version 2.8  19 Aug 2023  Mark Adler
  */
 
 /*
@@ -205,9 +205,12 @@
                        Fix bug when combining -l with -d
                        Exit with status of zero if skipping non .gz files
                        Permit Huffman only (-H) when not compiling with zopfli
+   2.8    19 Aug 2023  Fix version bug when compiling with zlib 1.3
+                       Save a modification time only for regular files
+                       Write all available uncompressed data on an error
  */
 
-#define VERSION "pigz 2.7"
+#define VERSION "pigz 2.8"
 
 /* To-do:
     - make source portable for Windows, VMS, etc. (see gzip source code)
@@ -374,11 +377,11 @@
 #  include <inttypes.h> // intmax_t, uintmax_t
    typedef uintmax_t length_t;
    typedef uint32_t crc_t;
-   typedef uint_least16_t index_t;
+   typedef uint_least16_t prefix_t;
 #else
    typedef unsigned long length_t;
    typedef unsigned long crc_t;
-   typedef unsigned index_t;
+   typedef unsigned prefix_t;
 #endif
 
 #ifdef PIGZ_DEBUG
@@ -558,9 +561,7 @@ local struct {
     int procs;              // maximum number of compression threads (>= 1)
     int setdict;            // true to initialize dictionary in each thread
     size_t block;           // uncompressed input size per thread (>= 32K)
-#ifndef NOTHREAD
     crc_t shift;            // pre-calculated CRC-32 shift for length block
-#endif
 
     // saved gzip/zip header data for decompression, testing, and listing
     time_t stamp;           // time stamp from gzip header
@@ -1335,11 +1336,8 @@ local long zlib_vernum(void) {
         }
         ver++;
     } while (left);
-    return left < 2 ? num << (left << 2) : -1;
+    return left < 3 ? num << (left << 2) : -1;
 }
-
-#ifndef NOTHREAD
-// -- threaded portions of pigz --
 
 // -- check value combination routines for parallel calculation --
 
@@ -1420,6 +1418,9 @@ local unsigned long adler32_comb(unsigned long adler1, unsigned long adler2,
     if (sum2 >= BASE) sum2 -= BASE;
     return sum1 | (sum2 << 16);
 }
+
+#ifndef NOTHREAD
+// -- threaded portions of pigz --
 
 // -- pool of spaces for buffer management --
 
@@ -3416,8 +3417,10 @@ local int outb(void *desc, unsigned char *buf, unsigned len) {
 
         // copy the output and alert the worker bees
         out_len = len;
-        g.out_tot += len;
-        memcpy(out_copy, buf, len);
+        if (len) {
+            g.out_tot += len;
+            memcpy(out_copy, buf, len);
+        }
         twist(outb_write_more, TO, 1);
         twist(outb_check_more, TO, 1);
 
@@ -3487,6 +3490,9 @@ local void infchk(void) {
         strm.next_in = Z_NULL;
         ret = inflateBack(&strm, inb, NULL, outb, NULL);
         inflateBackEnd(&strm);
+        g.in_left += strm.avail_in;
+        g.in_next = strm.next_in;
+        outb(NULL, NULL, 0);        // finish off final write and check
         if (ret == Z_DATA_ERROR)
             throw(EDOM, "%s: corrupted -- invalid deflate data (%s)",
                   g.inf, strm.msg);
@@ -3494,9 +3500,6 @@ local void infchk(void) {
             throw(EDOM, "%s: corrupted -- incomplete deflate data", g.inf);
         if (ret != Z_STREAM_END)
             throw(EINVAL, "internal error");
-        g.in_left += strm.avail_in;
-        g.in_next = strm.next_in;
-        outb(NULL, NULL, 0);        // finish off final write and check
 
         // compute compressed data length
         clen = g.in_tot - g.in_left;
@@ -3663,7 +3666,7 @@ local void unlzw(void) {
     // memory for unlzw() -- the first 256 entries of prefix[] and suffix[] are
     // never used, so could have offset the index but it's faster to waste a
     // little memory
-    index_t prefix[65536];              // index to LZW prefix string
+    prefix_t prefix[65536];             // index to LZW prefix string
     unsigned char suffix[65536];        // one-character LZW suffix
     unsigned char match[65280 + 2];     // buffer for reversed match
 
@@ -3809,7 +3812,7 @@ local void unlzw(void) {
             // link new table entry
             if (end < mask) {
                 end++;
-                prefix[end] = (index_t)prev;
+                prefix[end] = (prefix_t)prev;
                 suffix[end] = (unsigned char)final;
             }
 
@@ -3922,8 +3925,8 @@ local void process(char *path) {
         vstrcpy(&g.inf, &g.inz, 0, "<stdin>");
         g.ind = 0;
         g.name = NULL;
-        g.mtime = g.headis & 2 ?
-                  (fstat(g.ind, &st) ? time(NULL) : st.st_mtime) : 0;
+        g.mtime = (g.headis & 2) && fstat(g.ind, &st) == 0 &&
+                  S_ISREG(st.st_mode) ? st.st_mtime : 0;
         len = 0;
     }
     else {
@@ -4337,11 +4340,11 @@ local void defaults(void) {
     ZopfliInitOptions(&g.zopts);
 #endif
     g.block = 131072UL;             // 128K
+    g.shift = x2nmodp(g.block, 3);
 #ifdef NOTHREAD
     g.procs = 1;
 #else
     g.procs = nprocs(8);
-    g.shift = x2nmodp(g.block, 3);
 #endif
     g.rsync = 0;                    // don't do rsync blocking
     g.setdict = 1;                  // initialize dictionary each thread
@@ -4478,7 +4481,7 @@ local int option(char *arg) {
             case 'K':  g.form = 2;  g.sufx = ".zip";  break;
             case 'L':
                 puts(VERSION);
-                puts("Copyright (C) 2007-2022 Mark Adler");
+                puts("Copyright (C) 2007-2023 Mark Adler");
                 puts("Subject to the terms of the zlib license.");
                 puts("No warranty is provided or implied.");
                 exit(0);
